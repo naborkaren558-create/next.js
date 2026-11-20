@@ -1,7 +1,9 @@
 //! Scaling benchmarks: how throughput changes with the number of cores, for
-//! [`ConcurrentPriorityQueue`] compared with a `Mutex<BinaryHeap>` (strict priority order) and an
-//! unbounded `ConcurrentQueue` (lock-free, but no priority order at all, so it is a throughput
-//! reference rather than a drop-in alternative).
+//! [`ConcurrentPriorityQueue`] compared with a `Mutex<BinaryHeap>` of all items and a
+//! `Mutex<VecHeap>` (a heap of the distinct priorities plus a `Vec` of items per priority, like one
+//! shard of [`ConcurrentPriorityQueue`]), both with strict priority order, and an unbounded
+//! `ConcurrentQueue` (lock-free, but no priority order at all, so it is a throughput reference
+//! rather than a drop-in alternative).
 //!
 //! The benchmark uses one worker thread per available core ([`thread::available_parallelism`],
 //! which respects the process's CPU affinity). To measure scaling, run it several times with
@@ -44,7 +46,7 @@
 //! reporting a meaningless number.
 
 use std::{
-    collections::BinaryHeap,
+    collections::{BinaryHeap, HashMap},
     hint::black_box,
     sync::{
         Barrier,
@@ -104,6 +106,49 @@ impl BenchQueue for MutexHeap {
 
     fn pop(&self) -> Option<u64> {
         self.0.lock().pop().map(|(_, item)| item)
+    }
+}
+
+/// A heap of the distinct priorities plus a `Vec` of items per priority; items with the same
+/// priority are LIFO.
+#[derive(Default)]
+struct VecHeap {
+    priorities: BinaryHeap<u32>,
+    items: HashMap<u32, Vec<u64>>,
+}
+
+struct MutexVecHeap(Mutex<VecHeap>);
+
+impl BenchQueue for MutexVecHeap {
+    const NAME: &'static str = "mutex_vec_heap";
+
+    fn new() -> Self {
+        MutexVecHeap(Mutex::new(VecHeap::default()))
+    }
+
+    fn push(&self, priority: u32, item: u64) {
+        let mut queue = self.0.lock();
+        let VecHeap { priorities, items } = &mut *queue;
+        let list = items.entry(priority).or_default();
+        if list.is_empty() {
+            priorities.push(priority);
+        }
+        list.push(item);
+    }
+
+    fn pop(&self) -> Option<u64> {
+        let mut queue = self.0.lock();
+        let VecHeap { priorities, items } = &mut *queue;
+        let priority = *priorities.peek()?;
+        let list = items
+            .get_mut(&priority)
+            .expect("every priority in the heap has items");
+        let item = list.pop().expect("every priority in the heap has items");
+        if list.is_empty() {
+            items.remove(&priority);
+            priorities.pop();
+        }
+        Some(item)
     }
 }
 
@@ -463,6 +508,28 @@ fn check_uniform_priorities() {
     );
 }
 
+/// Checks on one thread that a strictly ordered queue pops every item, highest priority first.
+fn check_strict_order<Q: BenchQueue>() {
+    let queue = Q::new();
+    for index in 0..4096 {
+        let item = item(SETUP_THREAD, index);
+        queue.push(Mix::Uniform128.priority(item), item);
+    }
+    let mut last = u32::MAX;
+    let mut count = 0;
+    while let Some(item) = queue.pop() {
+        let priority = Mix::Uniform128.priority(item);
+        assert!(
+            priority <= last,
+            "{}: popped out of priority order",
+            Q::NAME
+        );
+        last = priority;
+        count += 1;
+    }
+    assert_eq!(count, 4096, "{}: items popped", Q::NAME);
+}
+
 fn bench_impl<Q: BenchQueue>(c: &mut Criterion, threads: usize) {
     let mut group = c.benchmark_group("turbo_concurrent_priority_queue_scaling");
     group.sample_size(10);
@@ -486,11 +553,15 @@ fn bench_impl<Q: BenchQueue>(c: &mut Criterion, threads: usize) {
 fn scaling(c: &mut Criterion) {
     check_fan_totals();
     check_uniform_priorities();
+    check_strict_order::<ConcurrentPriorityQueue<u32, u64>>();
+    check_strict_order::<MutexHeap>();
+    check_strict_order::<MutexVecHeap>();
     // One worker thread per available core; vary the core count from the outside (see the module
     // docs).
     let threads = thread::available_parallelism().map_or(1, |n| n.get());
     bench_impl::<ConcurrentPriorityQueue<u32, u64>>(c, threads);
     bench_impl::<MutexHeap>(c, threads);
+    bench_impl::<MutexVecHeap>(c, threads);
     bench_impl::<Unordered>(c, threads);
 }
 
