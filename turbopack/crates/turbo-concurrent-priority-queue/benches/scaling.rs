@@ -1,12 +1,19 @@
-//! Scaling benchmarks: how throughput changes with the number of threads, for
+//! Scaling benchmarks: how throughput changes with the number of cores, for
 //! [`ConcurrentPriorityQueue`] compared with a `Mutex<BinaryHeap>` (strict priority order) and an
 //! unbounded `ConcurrentQueue` (lock-free, but no priority order at all, so it is a throughput
 //! reference rather than a drop-in alternative).
 //!
+//! The benchmark uses one worker thread per available core ([`thread::available_parallelism`],
+//! which respects the process's CPU affinity). To measure scaling, run it several times with
+//! different core counts, e.g. `taskset -c 0,2,4,6 cargo bench ...` for 4 cores (on machines with
+//! SMT, pick one CPU per physical core first). Running fewer threads than cores, or more, would
+//! measure something else: idle cores, or threads being preempted while they hold a lock.
+//!
 //! Every benchmark iteration does a fixed amount of work, split across the threads, so the time per
 //! iteration directly shows how well an implementation scales: perfect scaling halves it when the
-//! thread count doubles. Benchmark ids are
-//! `turbo_concurrent_priority_queue_scaling/<workload>/<mix>/<impl>/<threads>`.
+//! core count doubles. Benchmark ids are
+//! `turbo_concurrent_priority_queue_scaling/<workload>/<mix>/<impl>/<threads>`, where `<threads>`
+//! is the number of available cores.
 //!
 //! Workloads:
 //! - `mixed1`, `mixed2`, `mixed128`, `mixed1024`: like a task scheduler, every thread pops an item
@@ -53,10 +60,8 @@ use parking_lot::Mutex;
 use turbo_concurrent_priority_queue::ConcurrentPriorityQueue;
 
 /// Items per iteration of every workload (all threads together): `fill` pushes and `drain` pops
-/// exactly this many, `mixed*` pops within 0.4% of it. Divisible by 32, so every thread count gets
-/// an exact share.
+/// exactly this many, `mixed*` pops within 0.4% of it.
 const TOTAL_OPS: usize = 1 << 19;
-const THREAD_COUNTS: [usize; 6] = [1, 2, 4, 8, 16, 32];
 /// How many generations of items with children a `mixed*` root item has (see [`Fan`]).
 const FAN_STEPS: u64 = 15;
 
@@ -315,7 +320,9 @@ fn work<Q: BenchQueue>(
     threads: usize,
     idle: &AtomicUsize,
 ) -> usize {
-    let share = workload.ops() / threads;
+    // The first `ops % threads` threads take one item more, so the shares add up to `ops` for any
+    // core count.
+    let share = workload.ops() / threads + usize::from(thread < workload.ops() % threads);
     match workload {
         Workload::Fan(fan) => {
             let mut popped = 0;
@@ -456,7 +463,7 @@ fn check_uniform_priorities() {
     );
 }
 
-fn bench_impl<Q: BenchQueue>(c: &mut Criterion, thread_counts: &[usize]) {
+fn bench_impl<Q: BenchQueue>(c: &mut Criterion, threads: usize) {
     let mut group = c.benchmark_group("turbo_concurrent_priority_queue_scaling");
     group.sample_size(10);
     group.warm_up_time(Duration::from_secs(1));
@@ -464,15 +471,13 @@ fn bench_impl<Q: BenchQueue>(c: &mut Criterion, thread_counts: &[usize]) {
     for workload in Workload::all() {
         group.throughput(Throughput::Elements(workload.ops() as u64));
         for mix in Mix::ALL {
-            for &threads in thread_counts {
-                let id = BenchmarkId::new(
-                    format!("{}/{}/{}", workload.name(), mix.name(), Q::NAME),
-                    threads,
-                );
-                group.bench_function(id, |b| {
-                    b.iter_custom(|iters| run::<Q>(workload, mix, threads, iters))
-                });
-            }
+            let id = BenchmarkId::new(
+                format!("{}/{}/{}", workload.name(), mix.name(), Q::NAME),
+                threads,
+            );
+            group.bench_function(id, |b| {
+                b.iter_custom(|iters| run::<Q>(workload, mix, threads, iters))
+            });
         }
     }
     group.finish();
@@ -481,14 +486,12 @@ fn bench_impl<Q: BenchQueue>(c: &mut Criterion, thread_counts: &[usize]) {
 fn scaling(c: &mut Criterion) {
     check_fan_totals();
     check_uniform_priorities();
-    let available = thread::available_parallelism().map_or(1, |n| n.get());
-    let thread_counts: Vec<usize> = THREAD_COUNTS
-        .into_iter()
-        .filter(|&threads| threads == 1 || threads <= available)
-        .collect();
-    bench_impl::<ConcurrentPriorityQueue<u32, u64>>(c, &thread_counts);
-    bench_impl::<MutexHeap>(c, &thread_counts);
-    bench_impl::<Unordered>(c, &thread_counts);
+    // One worker thread per available core; vary the core count from the outside (see the module
+    // docs).
+    let threads = thread::available_parallelism().map_or(1, |n| n.get());
+    bench_impl::<ConcurrentPriorityQueue<u32, u64>>(c, threads);
+    bench_impl::<MutexHeap>(c, threads);
+    bench_impl::<Unordered>(c, threads);
 }
 
 criterion_group!(benches, scaling);
