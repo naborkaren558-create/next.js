@@ -27,7 +27,7 @@
 //!   of the sharded queue, like in `drain`). A thread that finds the queue empty waits for other
 //!   threads' children until all threads are idle;
 //! - `drain`: the queue is prefilled with [`TOTAL_OPS`] items (not timed); all threads pop until it
-//!   is empty, each exactly its share;
+//!   is empty;
 //! - `fill`: all threads only push, [`TOTAL_OPS`] items together; the queue is drained afterwards
 //!   (not timed).
 //!
@@ -425,9 +425,6 @@ fn work<Q: BenchQueue>(
     idle: &AtomicUsize,
     random: &mut Random,
 ) -> usize {
-    // The first `ops % threads` threads take one item more, so the shares add up to `ops` for any
-    // core count.
-    let share = workload.ops() / threads + usize::from(thread < workload.ops() % threads);
     match workload {
         Workload::Fan(fan) => {
             let mut popped = 0;
@@ -438,16 +435,18 @@ fn work<Q: BenchQueue>(
             popped
         }
         Workload::Drain => {
-            for _ in 0..share {
-                black_box(
-                    queue
-                        .pop()
-                        .expect("drain: every thread pops exactly its share"),
-                );
+            let mut popped = 0;
+            while let Some(item) = queue.pop() {
+                black_box(item);
+                popped += 1;
             }
-            share
+            popped
         }
         Workload::Fill => {
+            // The first `ops % threads` threads push one item more, so the shares add up to `ops`
+            // for any core count.
+            let ops = workload.ops();
+            let share = ops / threads + usize::from(thread < ops % threads);
             for index in 0..share {
                 push_item(queue, mix, item(thread, index));
             }
