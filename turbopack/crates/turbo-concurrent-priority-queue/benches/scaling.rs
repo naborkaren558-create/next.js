@@ -67,12 +67,12 @@ use turbo_concurrent_priority_queue::ConcurrentPriorityQueue;
 /// Items per iteration of every workload (all threads together): `fill` pushes exactly this many,
 /// `drain` and `mixed*` pop exactly this many.
 const TOTAL_OPS: usize = 1 << 19;
-/// The work counter of the prefilled `mixed*` items that have children (see [`Fan`]).
-const FAN_WORK: u64 = 15;
-/// How many items the queue is prefilled with for `mixed*`: every one of them is popped, and the
-/// ones with children add `FAN_WORK` times their share, so `FAN_PREFILL * (1 + FAN_WORK)` items
-/// are popped in total.
-const FAN_PREFILL: usize = TOTAL_OPS / (1 + FAN_WORK as usize);
+/// How many items the queue is prefilled with for `mixed*` (see [`Fan`]).
+const FAN_PREFILL: usize = 4096;
+/// The work counter of the prefilled `mixed*` items that have children: every prefilled item is
+/// popped, and the ones with children add `FAN_WORK` times their share, so
+/// `FAN_PREFILL * (1 + FAN_WORK) = TOTAL_OPS` items are popped in total.
+const FAN_WORK: u64 = (TOTAL_OPS / FAN_PREFILL - 1) as u64;
 const _: () = assert!(FAN_PREFILL * (1 + FAN_WORK as usize) == TOTAL_OPS);
 /// The low bits of a `mixed*` item value that are pseudo-random and determine its priority; the
 /// bits above hold its work counter.
@@ -104,7 +104,34 @@ impl BenchQueue for ConcurrentPriorityQueue<u32, u64> {
     }
 }
 
-struct MutexHeap(Mutex<BinaryHeap<(u32, u64)>>);
+/// A [`MutexHeap`] entry, ordered by priority only: the item value doesn't break ties (for
+/// `mixed*` its high bits are the work counter, which would pop items with children first).
+struct HeapEntry {
+    priority: u32,
+    item: u64,
+}
+
+impl PartialEq for HeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.priority == other.priority
+    }
+}
+
+impl Eq for HeapEntry {}
+
+impl PartialOrd for HeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for HeapEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.priority.cmp(&other.priority)
+    }
+}
+
+struct MutexHeap(Mutex<BinaryHeap<HeapEntry>>);
 
 impl BenchQueue for MutexHeap {
     const NAME: &'static str = "mutex_heap";
@@ -114,11 +141,11 @@ impl BenchQueue for MutexHeap {
     }
 
     fn push(&self, priority: u32, item: u64) {
-        self.0.lock().push((priority, item));
+        self.0.lock().push(HeapEntry { priority, item });
     }
 
     fn pop(&self) -> Option<u64> {
-        self.0.lock().pop().map(|(_, item)| item)
+        self.0.lock().pop().map(|entry| entry.item)
     }
 }
 
@@ -459,12 +486,12 @@ fn run<Q: BenchQueue>(workload: Workload, mix: Mix, threads: usize, iters: u64) 
     thread::scope(|scope| {
         for thread in 0..threads {
             let (queue, start, end, idle, popped) = (&queue, &start, &end, &idle, &popped);
+            // Precomputed here, before any timing starts.
+            let mut random = Random::new(thread);
             scope.spawn(move || {
-                // Precomputed before the first iteration, so it isn't measured.
-                let mut random = Random::new(thread);
                 for _ in 0..iters {
-                    start.wait();
                     random.reset();
+                    start.wait();
                     let count = work(queue, workload, mix, thread, threads, idle, &mut random);
                     popped.fetch_add(count, Ordering::Relaxed);
                     end.wait();
@@ -507,6 +534,17 @@ fn check_fan_totals() {
         let queue = MutexStack::new();
         let mut random = Random::new(SETUP_THREAD);
         prefill(&queue, Workload::Fan(fan), Mix::Single, &mut random);
+        let prefilled = queue.0.lock().clone();
+        assert_eq!(prefilled.len(), FAN_PREFILL, "{}: prefill size", fan.name());
+        assert_eq!(
+            prefilled
+                .iter()
+                .filter(|&&item| item >> RANDOM_BITS == FAN_WORK)
+                .count(),
+            FAN_PREFILL / fan.children(),
+            "{}: prefilled items with children",
+            fan.name()
+        );
         let mut random = Random::new(0);
         let mut pops = 0;
         let mut counts = [0usize; 128];
@@ -600,6 +638,17 @@ fn bench_impl<Q: BenchQueue>(c: &mut Criterion, threads: usize) {
 fn scaling(c: &mut Criterion) {
     check_fan_totals();
     check_uniform_priorities();
+    // `MutexHeap` doesn't break ties by the item value (which holds the `mixed*` work counter).
+    assert!(
+        HeapEntry {
+            priority: 0,
+            item: FAN_WORK << RANDOM_BITS,
+        } == HeapEntry {
+            priority: 0,
+            item: 0,
+        },
+        "mutex_heap: the item value must not affect the order"
+    );
     check_strict_order::<ConcurrentPriorityQueue<u32, u64>>();
     check_strict_order::<MutexHeap>();
     check_strict_order::<MutexVecHeap>();
