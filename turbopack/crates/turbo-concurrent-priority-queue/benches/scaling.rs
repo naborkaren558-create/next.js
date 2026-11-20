@@ -19,13 +19,13 @@
 //!
 //! Workloads:
 //! - `mixed1`, `mixed2`, `mixed128`, `mixed1024`: like a task scheduler, every thread pops an item
-//!   and then pushes the item's children, until all work is done. The children of an item only
-//!   depend on its value (see [`Fan`]), so the total work is the same for every run and every
-//!   implementation (within 0.4% of [`TOTAL_OPS`] pops). `mixedN` items have `N` children, but only
-//!   one in `N` items has any (`mixed1`: every item has one child; `mixed1024`: one in 1024 items
-//!   has 1024 children). The queue is prefilled with the root items (not timed; they all land in
-//!   the prefilling thread's home shard of the sharded queue, like in `drain`). A thread that finds
-//!   the queue empty waits for other threads' children until all threads are idle;
+//!   and then pushes the item's children, until all work is done. `mixedN` items have `N` children,
+//!   but only one in `N` items has any (`mixed1`: every item has one child; `mixed1024`: one in
+//!   1024 items has 1024 children). Every item carries a remaining work counter (see [`Fan`]), so
+//!   every run and every implementation pops exactly [`TOTAL_OPS`] items. The queue is prefilled
+//!   with items of the same shape (not timed; they all land in the prefilling thread's home shard
+//!   of the sharded queue, like in `drain`). A thread that finds the queue empty waits for other
+//!   threads' children until all threads are idle;
 //! - `drain`: the queue is prefilled with [`TOTAL_OPS`] items (not timed); all threads pop until it
 //!   is empty, each exactly its share;
 //! - `fill`: all threads only push, [`TOTAL_OPS`] items together; the queue is drained afterwards
@@ -36,8 +36,11 @@
 //! - `skewed`: like a build: most items have the lowest priority, a few have one of three higher
 //!   ones. The priority is computed from the low bits of the item value (cheap, see
 //!   [`Mix::priority`]);
-//! - `uniform128`: the items are spread evenly over 128 priorities (the low 7 bits of the item
-//!   value).
+//! - `uniform128`: the items are spread over 128 priorities (the low 7 bits of the item value).
+//!
+//! `drain` and `fill` items have sequential values, so their priorities cycle through the mix.
+//! `mixed*` items get pseudo-random low bits: every thread precomputes [`RANDOM_LEN`] values from a
+//! fixed seed (outside the timed region) and takes them round robin.
 //!
 //! The worker threads are spawned once per Criterion sample; each iteration releases them with a
 //! start barrier and waits for them with an end barrier. Only the time between the two (including
@@ -61,11 +64,21 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use parking_lot::Mutex;
 use turbo_concurrent_priority_queue::ConcurrentPriorityQueue;
 
-/// Items per iteration of every workload (all threads together): `fill` pushes and `drain` pops
-/// exactly this many, `mixed*` pops within 0.4% of it.
+/// Items per iteration of every workload (all threads together): `fill` pushes exactly this many,
+/// `drain` and `mixed*` pop exactly this many.
 const TOTAL_OPS: usize = 1 << 19;
-/// How many generations of items with children a `mixed*` root item has (see [`Fan`]).
-const FAN_STEPS: u64 = 15;
+/// The work counter of the prefilled `mixed*` items that have children (see [`Fan`]).
+const FAN_WORK: u64 = 15;
+/// How many items the queue is prefilled with for `mixed*`: every one of them is popped, and the
+/// ones with children add `FAN_WORK` times their share, so `FAN_PREFILL * (1 + FAN_WORK)` items
+/// are popped in total.
+const FAN_PREFILL: usize = TOTAL_OPS / (1 + FAN_WORK as usize);
+const _: () = assert!(FAN_PREFILL * (1 + FAN_WORK as usize) == TOTAL_OPS);
+/// The low bits of a `mixed*` item value that are pseudo-random and determine its priority; the
+/// bits above hold its work counter.
+const RANDOM_BITS: u32 = 7;
+/// How many pseudo-random values every thread precomputes for `mixed*` items.
+const RANDOM_LEN: usize = 1 << 14;
 
 /// The operations the benchmarks need, implemented by every compared queue.
 trait BenchQueue: Sync {
@@ -172,20 +185,23 @@ impl BenchQueue for Unordered {
     }
 }
 
-/// How `mixed*` items fan out. An item value is `steps << 32 | low`. An item with `steps > 0` and
-/// a `low` that [`Fan::children`] accepts has that many children, with values
-/// `(steps - 1) << 32 | (low + i)` for `i` in `1..=children`; exactly one of them has children
-/// again (`low + children`, or `low + 1` for `mixed1`). So every root item starts a chain of
-/// [`FAN_STEPS`] fan-outs, and the work only depends on the root items.
+/// How `mixed*` items fan out. An item value is `work << RANDOM_BITS | random`: `random` is
+/// pseudo-random and determines the priority, `work` is the remaining work counter. An item with
+/// `work > 0` has [`Fan::children`] children: `children - 1` of them with `work = 0` (they have no
+/// children) and one with `work - 1`, all with new random bits. The prefill has the same shape:
+/// one in `children` of the [`FAN_PREFILL`] items has `work = FAN_WORK`, the others 0. So the
+/// total work doesn't depend on which thread pops which item: every item with children starts a
+/// chain of [`FAN_WORK`] fan-outs, and `FAN_PREFILL * (1 + FAN_WORK) = TOTAL_OPS` items are
+/// popped.
 #[derive(Clone, Copy)]
 enum Fan {
     /// Every item has 1 child.
     One,
-    /// Odd items have 2 children.
+    /// One in 2 items has 2 children.
     Two,
-    /// Every 128th item has 128 children.
+    /// One in 128 items has 128 children.
     OneTwentyEight,
-    /// Every 1024th item has 1024 children.
+    /// One in 1024 items has 1024 children.
     TenTwentyFour,
 }
 
@@ -201,54 +217,73 @@ impl Fan {
         }
     }
 
-    /// How many children an item with low value bits `low` (and `steps > 0`) has.
-    fn children(self, low: u32) -> u32 {
+    /// How many children an item with `work > 0` has.
+    fn children(self) -> usize {
         match self {
             Fan::One => 1,
-            Fan::Two => {
-                if low & 1 == 1 {
-                    2
-                } else {
-                    0
-                }
-            }
-            Fan::OneTwentyEight => {
-                if low & (128 - 1) == 0 {
-                    128
-                } else {
-                    0
-                }
-            }
-            Fan::TenTwentyFour => {
-                if low & (1024 - 1) == 0 {
-                    1024
-                } else {
-                    0
-                }
-            }
+            Fan::Two => 2,
+            Fan::OneTwentyEight => 128,
+            Fan::TenTwentyFour => 1024,
         }
     }
 
-    /// The number of root items, so that the total number of pops,
-    /// `roots * (1 + children * FAN_STEPS)`, is at most and close to [`TOTAL_OPS`] (within 0.4%).
-    fn roots(self) -> u32 {
-        let chain = 1 + u64::from(self.children(self.root_low(0))) * FAN_STEPS;
-        (TOTAL_OPS as u64 / chain).max(1) as u32
-    }
-
-    /// The low value bits of the `index`-th root item (one that has children).
-    fn root_low(self, index: u32) -> u32 {
-        match self {
-            Fan::One => index,
-            Fan::Two => 2 * index + 1,
-            Fan::OneTwentyEight => 128 * index,
-            Fan::TenTwentyFour => 1024 * index,
+    /// The work counter of the `index`-th prefilled item.
+    fn prefill_work(self, index: usize) -> u64 {
+        if index.is_multiple_of(self.children()) {
+            FAN_WORK
+        } else {
+            0
         }
     }
 
-    /// The total number of pops of one iteration: every root item and all its descendants.
-    fn total_pops(self) -> usize {
-        self.roots() as usize * (1 + self.children(self.root_low(0)) as usize * FAN_STEPS as usize)
+    /// Pushes the children of `item`, if it has any.
+    fn push_children<Q: BenchQueue>(self, queue: &Q, mix: Mix, random: &mut Random, item: u64) {
+        let work = item >> RANDOM_BITS;
+        if work > 0 {
+            for _ in 1..self.children() {
+                push_item(queue, mix, random.item(0));
+            }
+            push_item(queue, mix, random.item(work - 1));
+        }
+    }
+}
+
+const _: () = assert!(FAN_PREFILL.is_multiple_of(1024));
+
+/// Pseudo-random low bits for `mixed*` items: [`RANDOM_LEN`] values precomputed from a fixed
+/// seed, taken round robin.
+struct Random {
+    values: Box<[u8; RANDOM_LEN]>,
+    next: usize,
+}
+
+impl Random {
+    /// The values for `thread` (a worker thread index, or [`SETUP_THREAD`]).
+    fn new(thread: usize) -> Self {
+        // SplitMix64, seeded per thread.
+        let mut state = 0x5eed_0000_0000_0000 ^ (thread as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let mut values = Box::new([0; RANDOM_LEN]);
+        for value in values.iter_mut() {
+            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^= z >> 31;
+            *value = (z & ((1 << RANDOM_BITS) - 1)) as u8;
+        }
+        Random { values, next: 0 }
+    }
+
+    /// Starts over at the first value, so every iteration sees the same sequence.
+    fn reset(&mut self) {
+        self.next = 0;
+    }
+
+    /// A new `mixed*` item value with work counter `work` and the next random bits.
+    fn item(&mut self, work: u64) -> u64 {
+        let random = self.values[self.next];
+        self.next = (self.next + 1) % RANDOM_LEN;
+        work << RANDOM_BITS | u64::from(random)
     }
 }
 
@@ -277,10 +312,7 @@ impl Workload {
 
     /// Pops (`mixed*`, `drain`) or pushes (`fill`) of one iteration, all threads together.
     fn ops(self) -> usize {
-        match self {
-            Workload::Fan(fan) => fan.total_pops(),
-            Workload::Drain | Workload::Fill => TOTAL_OPS,
-        }
+        TOTAL_OPS
     }
 }
 
@@ -302,9 +334,9 @@ impl Mix {
         }
     }
 
-    /// The priority of an item, from the low bits of its value: for `skewed`, 12 in 16 items get
-    /// priority 0, 2 get 1, 1 gets 2 and 1 gets 3; for `uniform128`, the low 7 bits, so the items
-    /// are spread evenly over 128 priorities.
+    /// The priority of an item, from the low bits of its value: for `skewed`, from the low 4 bits,
+    /// 12 in 16 values get priority 0, 2 get 1, 1 gets 2 and 1 gets 3; for `uniform128`, the low 7
+    /// bits, so the items are spread over 128 priorities.
     fn priority(self, item: u64) -> u32 {
         match self {
             Mix::Single => 0,
@@ -364,6 +396,7 @@ fn work<Q: BenchQueue>(
     thread: usize,
     threads: usize,
     idle: &AtomicUsize,
+    random: &mut Random,
 ) -> usize {
     // The first `ops % threads` threads take one item more, so the shares add up to `ops` for any
     // core count.
@@ -373,14 +406,7 @@ fn work<Q: BenchQueue>(
             let mut popped = 0;
             while let Some(item) = pop_or_wait(queue, idle, threads) {
                 popped += 1;
-                let steps = item >> 32;
-                let low = item as u32;
-                if steps > 0 {
-                    let child_steps = (steps - 1) << 32;
-                    for i in 1..=fan.children(low) {
-                        push_item(queue, mix, child_steps | u64::from(low + i));
-                    }
-                }
+                fan.push_children(queue, mix, random, item);
             }
             popped
         }
@@ -403,11 +429,11 @@ fn work<Q: BenchQueue>(
     }
 }
 
-fn prefill<Q: BenchQueue>(queue: &Q, workload: Workload, mix: Mix) {
+fn prefill<Q: BenchQueue>(queue: &Q, workload: Workload, mix: Mix, random: &mut Random) {
     match workload {
         Workload::Fan(fan) => {
-            for index in 0..fan.roots() {
-                push_item(queue, mix, FAN_STEPS << 32 | u64::from(fan.root_low(index)));
+            for index in 0..FAN_PREFILL {
+                push_item(queue, mix, random.item(fan.prefill_work(index)));
             }
         }
         Workload::Drain => {
@@ -434,18 +460,23 @@ fn run<Q: BenchQueue>(workload: Workload, mix: Mix, threads: usize, iters: u64) 
         for thread in 0..threads {
             let (queue, start, end, idle, popped) = (&queue, &start, &end, &idle, &popped);
             scope.spawn(move || {
+                // Precomputed before the first iteration, so it isn't measured.
+                let mut random = Random::new(thread);
                 for _ in 0..iters {
                     start.wait();
-                    let count = work(queue, workload, mix, thread, threads, idle);
+                    random.reset();
+                    let count = work(queue, workload, mix, thread, threads, idle, &mut random);
                     popped.fetch_add(count, Ordering::Relaxed);
                     end.wait();
                 }
             });
         }
+        let mut setup_random = Random::new(SETUP_THREAD);
         let mut elapsed = Duration::ZERO;
         for _ in 0..iters {
             // Workers are waiting at the start barrier, so the queue is ours.
-            prefill(&queue, workload, mix);
+            setup_random.reset();
+            prefill(&queue, workload, mix, &mut setup_random);
             idle.store(0, Ordering::Relaxed);
             popped.store(0, Ordering::Relaxed);
             let begin = Instant::now();
@@ -454,8 +485,7 @@ fn run<Q: BenchQueue>(workload: Workload, mix: Mix, threads: usize, iters: u64) 
             elapsed += begin.elapsed();
             let left = drain_count(&queue);
             let (expected_left, expected_popped) = match workload {
-                Workload::Fan(fan) => (0, fan.total_pops()),
-                Workload::Drain => (0, TOTAL_OPS),
+                Workload::Fan(_) | Workload::Drain => (0, TOTAL_OPS),
                 Workload::Fill => (TOTAL_OPS, 0),
             };
             let id = format!("{}/{}/{}/{threads}", workload.name(), mix.name(), Q::NAME);
@@ -470,29 +500,46 @@ fn run<Q: BenchQueue>(workload: Workload, mix: Mix, threads: usize, iters: u64) 
     })
 }
 
-/// Checks [`Fan::total_pops`] against a sequential run of the fan-out rule.
+/// Checks with a sequential run that every `mixed*` workload pops exactly [`TOTAL_OPS`] items, and
+/// that its random bits spread the items over all 128 `uniform128` priorities.
 fn check_fan_totals() {
     for fan in Fan::ALL {
-        let mut stack: Vec<u64> = (0..fan.roots())
-            .map(|index| FAN_STEPS << 32 | u64::from(fan.root_low(index)))
-            .collect();
+        let queue = MutexStack::new();
+        let mut random = Random::new(SETUP_THREAD);
+        prefill(&queue, Workload::Fan(fan), Mix::Single, &mut random);
+        let mut random = Random::new(0);
         let mut pops = 0;
-        while let Some(item) = stack.pop() {
+        let mut counts = [0usize; 128];
+        while let Some(item) = queue.pop() {
             pops += 1;
-            let steps = item >> 32;
-            let low = item as u32;
-            if steps > 0 {
-                for i in 1..=fan.children(low) {
-                    stack.push((steps - 1) << 32 | u64::from(low + i));
-                }
-            }
+            counts[Mix::Uniform128.priority(item) as usize] += 1;
+            fan.push_children(&queue, Mix::Single, &mut random, item);
         }
-        assert_eq!(pops, fan.total_pops(), "{}: total pops", fan.name());
+        assert_eq!(pops, TOTAL_OPS, "{}: total pops", fan.name());
         assert!(
-            pops <= TOTAL_OPS && pops * 1000 >= TOTAL_OPS * 996,
-            "{}: {pops} pops, not within 0.4% of {TOTAL_OPS}",
+            counts.iter().all(|&count| count > 0),
+            "{}: not every uniform128 priority is used",
             fan.name()
         );
+    }
+}
+
+/// A plain stack for [`check_fan_totals`] (not benchmarked).
+struct MutexStack(Mutex<Vec<u64>>);
+
+impl BenchQueue for MutexStack {
+    const NAME: &'static str = "mutex_stack";
+
+    fn new() -> Self {
+        MutexStack(Mutex::new(Vec::new()))
+    }
+
+    fn push(&self, _priority: u32, item: u64) {
+        self.0.lock().push(item);
+    }
+
+    fn pop(&self) -> Option<u64> {
+        self.0.lock().pop()
     }
 }
 
