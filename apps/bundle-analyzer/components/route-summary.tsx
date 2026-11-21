@@ -1,7 +1,8 @@
 'use client'
 
-import { Suspense, useEffect, useRef } from 'react'
+import { useEffect, useRef } from 'react'
 import { useSearchParams } from 'next/navigation'
+import { ClientSuspense } from '@/components/client-suspense'
 import {
   RouteTypeahead,
   RouteTypeaheadContent,
@@ -12,9 +13,9 @@ import type { RouteSummary, RouteSizeTotals } from '@/lib/diff'
 
 export function RouteSummaryPage() {
   return (
-    <Suspense fallback={<RouteSummarySkeleton />}>
+    <ClientSuspense fallback={<RouteSummarySkeleton />}>
       <RouteSummaryContent />
-    </Suspense>
+    </ClientSuspense>
   )
 }
 

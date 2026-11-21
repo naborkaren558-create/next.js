@@ -1,16 +1,10 @@
 'use client'
 
-import {
-  Suspense,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type ReactNode,
-} from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import Link from 'next/link'
 import { usePathname, useSearchParams } from 'next/navigation'
 import useSWR from 'swr'
+import { ClientSuspense } from '@/components/client-suspense'
 import {
   CompareLayout,
   type CompareLayoutModel,
@@ -95,9 +89,11 @@ function AnalyzerBoundary({
   fallback?: ReactNode
 }) {
   return (
-    <Suspense fallback={fallback ?? <AnalyzerFallback view={defaultView} />}>
+    <ClientSuspense
+      fallback={fallback ?? <AnalyzerFallback view={defaultView} />}
+    >
       {children}
-    </Suspense>
+    </ClientSuspense>
   )
 }
 
